@@ -1,0 +1,224 @@
+// 注入 domain_resolver：读取 mihomo 订阅的 dns.proxy-server-nameserver，
+// 生成 sing-box DNS server（必要时 group），并注入到对应节点的 outbound
+//
+// 支持多个提供商（每个都需要私有 DNS）：
+//   $arguments.providers 为 JSON 字符串 / Sub-Store 文件引用，每项：
+//     psnSub    - mihomo 订阅名（必填）
+//     psnTag    - 生成的 DNS server / group 的 tag 前缀（默认 psn，多提供商请各自指定不同值）
+//     psnPrefix - 节点 tag 前缀过滤（默认 `${psnSub} / `，可按实际格式自定义）
+//     detour    - 可选，DNS 查询走的出站 tag（如 Proxy / Direct），留空则直连
+//     psn       - 可选，手动指定 proxy-server-nameserver（用 | 分隔多个），优先于从订阅读取
+//     psnFile   - 可选，Sub-Store 文件（source=remote 填机场订阅 URL，或本地内容）用于读取完整 mihomo yaml；
+//                 远程订阅（库里无 content）必须配这个或 psn，否则读不到 dns 配置
+//
+// providers 的两种写法：
+//   1. JSON 字符串：providers = '[{"psnSub":"YOUR_PROVIDER","psnTag":"psn"}]'
+//   2. Sub-Store 文件内部路径：providers = 'file:文件名' 或 '/api/file/文件名'（本地文件，内容为 JSON 数组）
+//   可选 providersType = 'string' | 'file' | 'auto'（默认 auto 自动判断：先试 JSON，失败再按文件找）
+//
+// 单提供商写法：$arguments.psnSub ($arguments 直接为 $arguments.providers[0])
+// 可选 psnTag / psnPrefix / detour / psn / psnFile
+//
+// mihomo DNS 写法覆盖: system / 裸IP / udp:// tcp:// tls:// https:// quic:// dhcp://
+// 附加参数: #h3 #skip-cert-verify 生效; #proxy/#interface/#RULES 保留原 DNS 但舍弃该参数
+//   （要 DNS 走代理请用 detour 参数）; #ecs 等无对应字段，忽略
+function loadProviders() {
+  const fileRef = function (name) {
+    const files = readArray('files');
+    const f = files.find(function (x) { return x && x.name === name; });
+    if (!f) throw new Error('providers file not found: ' + name);
+    if (!f.content) throw new Error('providers file has no local content: ' + name);
+    return JSON.parse(f.content);
+  };
+  const asArray = function (v) {
+    if (Array.isArray(v)) return v;
+    const o = JSON.parse(v);
+    return Array.isArray(o) ? o : [o];
+  };
+  let raw;
+  if (Array.isArray($arguments)) return $arguments;
+  if ($arguments && $arguments.providers !== undefined) raw = $arguments.providers;
+  else if ($arguments && $arguments.psnSub) return [$arguments];
+  if (raw === undefined || raw === null || raw === '') return [];
+  if (Array.isArray(raw)) return raw;
+  const type = ($arguments && $arguments.providersType) || 'auto';
+  const s = String(raw).trim();
+  if (s.indexOf('file:') === 0) return asArray(fileRef(s.slice(5)));
+  if (s.indexOf('/api/file/') === 0) return asArray(fileRef(decodeURIComponent(s.split('/').pop())));
+  if (type === 'file') return asArray(fileRef(s));
+  if (type === 'string') return asArray(s);
+  try { return asArray(s); } catch (e) { /* 继续尝试文件 */ }
+  try { return asArray(fileRef(s)); } catch (e2) {
+    console.log('psn: providers 既不是 JSON 也不是文件: ' + s);
+    return [];
+  }
+}
+
+let providers = [];
+try {
+  providers = loadProviders();
+} catch (e) {
+  console.log('psn: load providers failed: ' + (e && e.message || e));
+}
+
+function isIP(v) {
+  if (!v) return false;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(v)) return true;
+  if (v.indexOf(':') >= 0) return true; // IPv6
+  return false;
+}
+
+// read 可能返回数组 / JSON 字符串 / null / undefined，统一成数组
+function readArray(key) {
+  try {
+    const raw = ($substore && $substore.read) ? $substore.read(key) : null;
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === 'string') {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch (e) { /* 读不到就当没有 */ }
+  return [];
+}
+
+// mihomo DNS 地址 → sing-box DNS server 配置（不含 tag/detour/domain_resolver）
+function mihomoDnsToServer(addr) {
+  if (addr == null || addr === '') return null;
+  const raw = String(addr).trim();
+  const hashIdx = raw.indexOf('#');
+  const base = hashIdx >= 0 ? raw.slice(0, hashIdx) : raw;
+  const params = {};
+  if (hashIdx >= 0) {
+    raw.slice(hashIdx + 1).split('&').filter(Boolean).forEach(function (p) {
+      const eq = p.indexOf('=');
+      if (eq >= 0) params[p.slice(0, eq)] = p.slice(eq + 1);
+      else params[p] = true;
+    });
+  }
+  if (base === 'system' || base === 'system://') return { type: 'local' };
+  if (/^rcode:/.test(base)) return null; // sing-box 无 rcode 类型
+  let scheme = '';
+  let rest = base;
+  const m = base.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/(.*)$/);
+  if (m) { scheme = m[1].toLowerCase(); rest = m[2]; }
+  if (scheme === 'dhcp') {
+    const server = { type: 'dhcp' };
+    if (rest && rest !== 'system') server.interface = rest;
+    return server;
+  }
+  let port = 0;
+  let path = '';
+  const slash = rest.indexOf('/');
+  if (slash >= 0) { path = rest.slice(slash); rest = rest.slice(0, slash); }
+  let host = rest;
+  if (rest.charAt(0) === '[') {
+    const close = rest.indexOf(']');
+    if (close > 0) {
+      host = rest.slice(1, close);
+      const pm = rest.slice(close + 1).match(/^:(\d+)$/);
+      if (pm) port = parseInt(pm[1], 10);
+    }
+  } else {
+    const idx = rest.lastIndexOf(':');
+    if (idx > 0 && /^\d+$/.test(rest.slice(idx + 1))) {
+      host = rest.slice(0, idx);
+      port = parseInt(rest.slice(idx + 1), 10);
+    }
+  }
+  if (!host) return null;
+  let type = scheme || 'udp';
+  if (params.h3) type = 'h3';
+  const server = { type: type, server: host };
+  if (port) server.server_port = port;
+  if ((type === 'https' || type === 'h3') && path) server.path = path;
+  if (params['skip-cert-verify']) server.insecure = true;
+  return server;
+}
+
+try {
+  const config = JSON.parse($content);
+  for (const cfg of providers) {
+    if (!cfg || !cfg.psnSub) continue;
+    const psnSub = cfg.psnSub;
+    const psnTag = cfg.psnTag || 'psn';
+    const psnDetour = cfg.detour || '';
+    const psnPrefix = cfg.psnPrefix || psnSub + ' / ';
+    let psnList = [];
+    let psnSource = '';
+    if (cfg.psn) {
+      // 1. 手动指定优先
+      psnList = String(cfg.psn).split('|').map(function (s) { return s.trim(); }).filter(Boolean);
+      psnSource = 'manual';
+    } else {
+      // 2. 本地订阅内容（库里有 content 的）
+      let doc = null;
+      try {
+        const sub = readArray('subs').find(function (s) { return s && s.name === psnSub; });
+        if (sub && sub.content) doc = yaml.load(sub.content);
+      } catch (e) { /* 忽略 */ }
+      if (!doc && cfg.psnFile) {
+        // 3. 远程订阅：通过 Sub-Store 文件拿原始内容
+        //    type=file 的 raw 不做 Clash 预处理，保留完整 yaml（含 dns 段）
+        //    注意：type=subscription 的 raw 会被 Clash Pre-processor 处理成只剩 proxies，拿不到 dns（所有版本都如此）
+        try {
+          const rawResult = await produceArtifact({ type: 'file', name: cfg.psnFile, produceType: 'raw' });
+          const arr = JSON.parse(rawResult);
+          const text = (Array.isArray(arr) ? arr : [arr]).filter(function (i) { return typeof i === 'string' && i.length > 0; })[0];
+          if (text) doc = yaml.load(text);
+        } catch (e) {
+          console.log('psn[' + psnSub + ']: produceArtifact file raw failed: ' + (e && e.message || e));
+        }
+      }
+      if (doc && doc.dns) {
+        if (doc.dns['proxy-server-nameserver']) {
+          psnList = doc.dns['proxy-server-nameserver'];
+          psnSource = 'proxy-server-nameserver';
+        } else if (doc.dns.nameserver) {
+          // mihomo 语义：proxy-server-nameserver 为空时遵循 nameserver
+          psnList = doc.dns.nameserver;
+          psnSource = 'nameserver (fallback)';
+        }
+        if (!Array.isArray(psnList)) psnList = [psnList];
+      }
+    }
+    if (psnSource) console.log('psn[' + psnSub + ']: dns source = ' + psnSource);
+    const servers = (psnList || []).map(mihomoDnsToServer).filter(Boolean);
+    if (servers.length === 0) continue;
+    const dns = config.dns || (config.dns = {});
+    dns.servers = dns.servers || [];
+    const existing = {};
+    dns.servers.forEach(function (s) { if (s && s.tag) existing[s.tag] = true; });
+    // tag 冲突时自动加后缀
+    const freeTag = function (want) {
+      let tag = want;
+      let n = 1;
+      while (existing[tag]) { tag = want + '-' + (n++); }
+      return tag;
+    };
+    const entries = servers.map(function (s, i) {
+      const tag = freeTag(servers.length > 1 ? psnTag + '-' + i : psnTag);
+      const entry = Object.assign({ tag: tag }, s);
+      if (psnDetour) entry.detour = psnDetour;
+      if (!isIP(entry.server)) entry.domain_resolver = 'local';
+      existing[tag] = true;
+      return entry;
+    });
+    entries.forEach(function (e) { dns.servers.push(e); });
+    let resolverTag = entries[0].tag;
+    if (servers.length > 1) {
+      const groupTag = freeTag(psnTag);
+      const group = { type: 'group', tag: groupTag, servers: entries.map(function (e) { return e.tag; }) };
+      existing[groupTag] = true;
+      dns.servers.push(group);
+      resolverTag = groupTag;
+    }
+    (config.outbounds || []).forEach(function (o) {
+      if (o && o.tag && o.tag.indexOf(psnPrefix) === 0 && o.server && !isIP(o.server) && !o.domain_resolver) {
+        o.domain_resolver = resolverTag;
+      }
+    });
+  }
+  $content = JSON.stringify(config, null, 2);
+} catch (e) {
+  console.log('psn: inject failed: ' + (e && e.message || e));
+}
