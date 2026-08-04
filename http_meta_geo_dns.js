@@ -8,6 +8,13 @@
  * 依赖: http-meta 的 /start 接口需要支持接收 dns / hosts 字段 (合并进生成的 mihomo 配置),
  *       原版只取 proxies, 需对 meta/index.js 的 genConfig 打补丁或使用支持该特性的版本。
  *
+ * dns 透传策略: 非手动指定的 dns (从订阅/文件读取) 会做白名单清洗, 只保留
+ * nameserver/fallback 相关字段 (default-nameserver / nameserver / nameserver-policy /
+ * proxy-server-nameserver / fallback / direct-nameserver 等) 与基础行为字段,
+ * 去掉路由相关 (fallback-filter / respect-rules / geosite|geoip 前缀的 policy 键 /
+ * fake-ip-filter-mode: rule), 因此测试核心不需要下载 GeoIP/GeoSite .dat。
+ * 手动指定的 dns 参数则原样透传。
+ *
  * 查看说明: https://t.me/zhetengsha/1269 (落地检测)
  * 送中检测: https://t.me/zhetengsha/4283
  *
@@ -65,8 +72,46 @@ function readArray(key) {
 }
 
 // 读取 dns + hosts: 手动参数 > 订阅 content > psnFile (produceArtifact type:file raw)
+// 非手动指定的 dns 会做白名单清洗, 只保留 nameserver/fallback 相关 + 基础行为字段,
+// 去掉路由相关 (fallback-filter / respect-rules / geosite|geoip 前缀的 policy), 避免测试核心下载 .dat
+function sanitizeDns(dns) {
+  if (!dns || typeof dns !== 'object') return null;
+  const out = {};
+  const baseKeys = [
+    'enable', 'ipv6', 'cache-algorithm', 'prefer-h3',
+    'use-hosts', 'use-system-hosts',
+    'enhanced-mode', 'fake-ip-range', 'fake-ip-range6',
+    'fake-ip-filter', 'fake-ip-ttl', 'listen',
+  ];
+  baseKeys.forEach(function (k) { if (dns[k] !== undefined) out[k] = dns[k]; });
+  // fake-ip-filter-mode: rule 走路由匹配(可含 GEOSITE), 非 rule 才保留
+  if (dns['fake-ip-filter-mode'] !== undefined && dns['fake-ip-filter-mode'] !== 'rule') {
+    out['fake-ip-filter-mode'] = dns['fake-ip-filter-mode'];
+  }
+  const nsKeys = [
+    'default-nameserver', 'nameserver', 'proxy-server-nameserver', 'fallback',
+    'direct-nameserver', 'direct-nameserver-follow-policy',
+  ];
+  nsKeys.forEach(function (k) { if (dns[k] !== undefined) out[k] = dns[k]; });
+  // nameserver-policy / proxy-server-nameserver-policy: 去掉 geosite:/geoip: 前缀键(需要 .dat)
+  ['nameserver-policy', 'proxy-server-nameserver-policy'].forEach(function (pk) {
+    const policy = dns[pk];
+    if (!policy || typeof policy !== 'object') return;
+    const clean = {};
+    Object.keys(policy).forEach(function (k) {
+      if (k.indexOf('geosite:') === 0 || k.indexOf('geoip:') === 0) return;
+      clean[k] = policy[k];
+    });
+    if (Object.keys(clean).length) out[pk] = clean;
+  });
+  // 不传: respect-rules / fallback-filter (路由相关, fallback-filter 的 geoip/geosite 需要 .dat)
+  return Object.keys(out).length ? out : null;
+}
+
+// 读取 dns + hosts: 手动参数 > 订阅 content > psnFile (produceArtifact type:file raw)
 async function loadDnsHosts() {
   const out = { dns: null, hosts: null };
+  // 1. 手动指定: 原样透传, 不清洗
   if ($arguments.dns) {
     try { out.dns = yaml.load(String($arguments.dns)); } catch (e) { $substore.error('dns 参数解析失败: ' + (e.message || e)); }
   }
@@ -92,7 +137,8 @@ async function loadDnsHosts() {
     }
   }
   if (doc) {
-    if (!out.dns && doc.dns) out.dns = doc.dns;
+    // 2/3. 从订阅/文件读取: dns 做白名单清洗, hosts 原样
+    if (!out.dns && doc.dns) out.dns = sanitizeDns(doc.dns);
     if (!out.hosts && doc.hosts) out.hosts = doc.hosts;
   }
   if (out.dns || out.hosts) {
