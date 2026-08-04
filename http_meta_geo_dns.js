@@ -9,11 +9,12 @@
  *       原版只取 proxies, 需对 meta/index.js 的 genConfig 打补丁或使用支持该特性的版本。
  *
  * dns 透传策略: 非手动指定的 dns (从订阅/文件读取) 会做白名单清洗, 只保留
- * nameserver/fallback 相关字段 (default-nameserver / nameserver / nameserver-policy /
- * proxy-server-nameserver / fallback / direct-nameserver 等) 与基础行为字段,
+ * nameserver 相关字段 (default-nameserver / nameserver / nameserver-policy /
+ * proxy-server-nameserver / direct-nameserver 等) 与基础行为字段,
  * 去掉路由相关 (fallback-filter / respect-rules / geosite|geoip 前缀的 policy 键 /
- * fake-ip-filter-mode: rule), 因此测试核心不需要下载 GeoIP/GeoSite .dat。
- * 手动指定的 dns 参数则原样透传。
+ * fake-ip-filter-mode: rule) 与 fallback —— 配置 fallback 后 mihomo 会默认启用
+ * fallback-filter(geoip-code cn) 又要求 GeoIP .dat, 因此一并去除, 测试核心无需下载 .dat。
+ * 手动指定的 dns 参数则原样透传; dns.enable=false 时一律不透传 (回退 http-meta 默认 dns)。
  *
  * 查看说明: https://t.me/zhetengsha/1269 (落地检测)
  * 送中检测: https://t.me/zhetengsha/4283
@@ -89,9 +90,11 @@ function sanitizeDns(dns) {
     out['fake-ip-filter-mode'] = dns['fake-ip-filter-mode'];
   }
   const nsKeys = [
-    'default-nameserver', 'nameserver', 'proxy-server-nameserver', 'fallback',
+    'default-nameserver', 'nameserver', 'proxy-server-nameserver',
     'direct-nameserver', 'direct-nameserver-follow-policy',
   ];
+  // 注意: fallback 不保留 —— 配置 fallback 后 mihomo 默认启用 fallback-filter(geoip-code cn),
+  // 又会要求 GeoIP .dat; fallback 只能配合 fallback-filter 使用, 而后者是路由相关已去除
   nsKeys.forEach(function (k) { if (dns[k] !== undefined) out[k] = dns[k]; });
   // nameserver-policy / proxy-server-nameserver-policy: 去掉 geosite:/geoip: 前缀键(需要 .dat)
   ['nameserver-policy', 'proxy-server-nameserver-policy'].forEach(function (pk) {
@@ -140,6 +143,11 @@ async function loadDnsHosts() {
     // 2/3. 从订阅/文件读取: dns 做白名单清洗, hosts 原样
     if (!out.dns && doc.dns) out.dns = sanitizeDns(doc.dns);
     if (!out.hosts && doc.hosts) out.hosts = doc.hosts;
+  }
+  // dns.enable=false: 订阅自己都关掉了 DNS, 无配置可复现, 不透传 (回退 http-meta tpl.yaml 的 dns)
+  if (out.dns && out.dns.enable === false) {
+    $substore.info('[http-meta] dns.enable=false, 不透传 dns (回退 http-meta 默认)');
+    out.dns = null;
   }
   if (out.dns || out.hosts) {
     $substore.info(`[http-meta] dns=${out.dns ? 'yes' : 'no'} hosts=${out.hosts ? 'yes' : 'no'} (sub=${$arguments.sub || '-'})`);
