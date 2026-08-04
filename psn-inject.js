@@ -22,6 +22,13 @@
 // mihomo DNS 写法覆盖: system / 裸IP / udp:// tcp:// tls:// https:// quic:// dhcp://
 // 附加参数: #h3 #skip-cert-verify 生效; #proxy/#interface/#RULES 保留原 DNS 但舍弃该参数
 //   （要 DNS 走代理请用 detour 参数）; #ecs 等无对应字段，忽略
+//
+// hosts: 读取订阅的 hosts 段，追加到 tag=hosts 的 DNS server（无则创建；不覆盖已有键；
+//   通配符键跳过——sing-box hosts server 只做精确匹配）。
+// 新增 DNS server 的域名解析：hostname 命中 hosts 且非 TLS 类型（udp/tcp）时直接用 hosts IP 替换；
+//   其余（TLS 类换 IP 会破坏 SNI/证书校验，或不在 hosts）用 domain_resolver='local'。
+//   注：sing-box 的 dns group 取首个响应，hosts 对未列域名回 NXDOMAIN 会抢先导致 local 永不生效，
+//   因此不建 hosts+local 的 group。
 function loadProviders() {
   const fileRef = function (name) {
     const files = readArray('files');
@@ -66,6 +73,25 @@ function isIP(v) {
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(v)) return true;
   if (v.indexOf(':') >= 0) return true; // IPv6
   return false;
+}
+
+// hosts predefined 里找 host 的 IP（精确匹配，忽略大小写）；值可能是 IP / IP 数组 / 域名，只取 IP
+function pickHostsIP(hostsMap, host) {
+  if (!hostsMap || !host) return null;
+  const h = String(host).toLowerCase();
+  let v = null;
+  Object.keys(hostsMap).forEach(function (k) {
+    if (!v && String(k).toLowerCase() === h) v = hostsMap[k];
+  });
+  if (!v) return null;
+  if (Array.isArray(v)) return v.find(isIP) || null;
+  if (typeof v === 'string' && isIP(v)) return v;
+  return null;
+}
+
+// TLS 类 DNS server 换 IP 会破坏 SNI/证书校验，不能替换
+function isTlsDnsType(type) {
+  return type === 'https' || type === 'h3' || type === 'tls' || type === 'quic';
 }
 
 // read 可能返回数组 / JSON 字符串 / null / undefined，统一成数组
@@ -145,13 +171,13 @@ try {
     const psnPrefix = cfg.psnPrefix || psnSub + ' / ';
     let psnList = [];
     let psnSource = '';
+    let doc = null;
     if (cfg.psn) {
       // 1. 手动指定优先
       psnList = String(cfg.psn).split('|').map(function (s) { return s.trim(); }).filter(Boolean);
       psnSource = 'manual';
     } else {
       // 2. 本地订阅内容（库里有 content 的）
-      let doc = null;
       try {
         const sub = readArray('subs').find(function (s) { return s && s.name === psnSub; });
         if (sub && sub.content) doc = yaml.load(sub.content);
@@ -182,8 +208,6 @@ try {
       }
     }
     if (psnSource) console.log('psn[' + psnSub + ']: dns source = ' + psnSource);
-    const servers = (psnList || []).map(mihomoDnsToServer).filter(Boolean);
-    if (servers.length === 0) continue;
     const dns = config.dns || (config.dns = {});
     dns.servers = dns.servers || [];
     const existing = {};
@@ -195,11 +219,45 @@ try {
       while (existing[tag]) { tag = want + '-' + (n++); }
       return tag;
     };
+    // hosts: 追加到 tag=hosts 的 dns server（无则创建），predefined 合并，不覆盖已有键，通配符键跳过
+    let hostsMap = null;
+    if (doc && doc.hosts && typeof doc.hosts === 'object') {
+      let hostsServer = dns.servers.find(function (s) { return s && s.tag === 'hosts'; });
+      if (!hostsServer) {
+        hostsServer = { type: 'hosts', tag: 'hosts' };
+        dns.servers.push(hostsServer);
+        existing['hosts'] = true;
+      }
+      if (!hostsServer.predefined || typeof hostsServer.predefined !== 'object') hostsServer.predefined = {};
+      let added = 0;
+      Object.keys(doc.hosts).forEach(function (k) {
+        if (k.indexOf('*') >= 0) {
+          console.log('psn[' + psnSub + ']: hosts 通配符键 ' + k + ' 无法在 sing-box hosts server 精确匹配, 跳过');
+          return;
+        }
+        if (hostsServer.predefined[k] !== undefined) return; // 不覆盖已有
+        hostsServer.predefined[k] = doc.hosts[k];
+        added++;
+      });
+      if (added > 0) console.log('psn[' + psnSub + ']: hosts 合并 ' + added + ' 条 -> tag=hosts');
+      hostsMap = hostsServer.predefined;
+    }
+    const servers = (psnList || []).map(mihomoDnsToServer).filter(Boolean);
+    if (servers.length === 0) continue;
     const entries = servers.map(function (s, i) {
       const tag = freeTag(servers.length > 1 ? psnTag + '-' + i : psnTag);
       const entry = Object.assign({ tag: tag }, s);
       if (psnDetour) entry.detour = psnDetour;
-      if (!isIP(entry.server)) entry.domain_resolver = 'local';
+      if (!isIP(entry.server)) {
+        // hosts 感知: hostname 命中 hosts 且非 TLS 类型时直接用 hosts IP；否则 local 解析
+        const hostIP = pickHostsIP(hostsMap, entry.server);
+        if (hostIP && !isTlsDnsType(entry.type)) {
+          console.log('psn[' + psnSub + ']: ' + entry.server + ' -> hosts IP ' + hostIP);
+          entry.server = hostIP;
+        } else {
+          entry.domain_resolver = 'local';
+        }
+      }
       existing[tag] = true;
       return entry;
     });
