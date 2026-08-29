@@ -33,7 +33,10 @@ filterTypes = ["direct", "selector", "urltest", "loadbalance", "smart", "dns"]
 configProxies = filterGroup(config.outbounds, filterTypes)
 
 config.outbounds.map(i => {
-  if (['🗺️ all', '🗺️ all-smart', '🗺️ all-auto', '🗺️ all-balance', '🤖 AI-!cn'].includes(i.tag)) {
+  if (['🤖 AI-!cn'].includes(i.tag)) {
+    i.outbounds.push(...getTags(configProxies, /^(?!.*(?:!送中!|!失败!)).*/i))
+  }
+  if (['🗺️ all', '🗺️ all-smart', '🗺️ all-auto', '🤖 AI-!cn'].includes(i.tag)) {
     i.outbounds.push(...getTags(configProxies))
   }
   if (['🇭🇰 hk', '🇭🇰 hk-smart', '🇭🇰 hk-auto'].includes(i.tag)) {

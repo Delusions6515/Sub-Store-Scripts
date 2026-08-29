@@ -455,13 +455,6 @@
       "tolerance": 50
     },
     {
-      "tag": "🗺️ all-balance",
-      "type": "loadbalance",
-      "outbounds": [],
-      "url": "https://www.gstatic.com/generate_204",
-      "interval": "1m"
-    },
-    {
       "tag": "🇨🇳 送中-balance",
       "type": "loadbalance",
       "outbounds": [],
@@ -539,11 +532,7 @@
       },
       {
         "domain_suffix": ["lmstudio.ai"],
-        "outbound": "Proxy"
-      },
-      {
-        "domain_suffix": ["opencode.ai"],
-        "outbound": "🗺️ all-balance"
+        "outbound": "⬇️ Download-!cn"
       },
       {
         "rule_set": ["geosite-category-ai-!cn"],
