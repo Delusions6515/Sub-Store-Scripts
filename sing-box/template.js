@@ -1,3 +1,22 @@
+// comment-json is supplied by a Sub-Store file (local or Release URL).
+async function loadCommentJSON() {
+  const file = $arguments?.commentJsonFile || 'comment-json'
+  const code = await produceArtifact({ type: 'file', name: file })
+  const expected = $arguments?.commentJsonSha256
+  if (expected != null && expected !== '') {
+    if (!/^[a-f0-9]{64}$/i.test(expected)) throw new Error('Invalid commentJsonSha256')
+    if (typeof require !== 'function') throw new Error('commentJsonSha256 requires Node.js crypto')
+    const digest = require('node:crypto').createHash('sha256').update(code).digest('hex')
+    if (digest !== expected.toLowerCase()) throw new Error(`Sub-Store file ${file} checksum mismatch`)
+  }
+  const moduleUrl = `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
+  const library = (await import(moduleUrl)).library
+  if (typeof library?.parse !== 'function' || typeof library?.stringify !== 'function') {
+    throw new Error('Sub-Store file does not export comment-json')
+  }
+  return library
+}
+
 const { type, name, includeUnsupportedProxy } = $arguments
 const compatible_outbound = {
   tag: 'COMPATIBLE',
@@ -5,7 +24,15 @@ const compatible_outbound = {
 }
 
 let compatible
-let config = JSON.parse($files[0])
+const CommentJSON = await loadCommentJSON()
+let config
+try {
+  config = CommentJSON.parse($files[0])
+} catch (error) {
+  throw error instanceof SyntaxError
+    ? new Error(`template: invalid JSONC input: ${error.message}`)
+    : error
+}
 
 // —— 缓存：produceArtifact 结果缓存 6h，刷新窗口由链首清道夫控制 ——
 const cache = scriptResourceCache
@@ -32,7 +59,7 @@ config.outbounds.push(...proxies)
 filterTypes = ["direct", "selector", "urltest", "loadbalance", "smart", "dns"]
 configProxies = filterGroup(config.outbounds, filterTypes)
 
-config.outbounds.map(i => {
+config.outbounds.forEach(i => {
   if (['🤖 AI-!cn'].includes(i.tag)) {
     i.outbounds.push(...getTags(configProxies, /^(?!.*(?:!送中!|!失败!)).*/i))
   }
@@ -69,7 +96,7 @@ config.outbounds.forEach(outbound => {
   }
 });
 
-$content = JSON.stringify(config, null, 2)
+$content = CommentJSON.stringify(config, null, 2)
 
 function getTags(proxies, regex) {
   return (regex ? proxies.filter(p => regex.test(p.tag)) : proxies).map(p => p.tag)

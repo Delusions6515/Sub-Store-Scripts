@@ -29,17 +29,43 @@
 //   其余（TLS 类换 IP 会破坏 SNI/证书校验，或不在 hosts）用 domain_resolver='local'。
 //   注：sing-box 的 dns group 取首个响应，hosts 对未列域名回 NXDOMAIN 会抢先导致 local 永不生效，
 //   因此不建 hosts+local 的 group。
+const CommentJSON = await loadCommentJSON();
+
+// comment-json is supplied by a Sub-Store file (local or Release URL).
+async function loadCommentJSON() {
+  const file = $arguments?.commentJsonFile || 'comment-json'
+  const code = await produceArtifact({ type: 'file', name: file })
+  const expected = $arguments?.commentJsonSha256
+  if (expected != null && expected !== '') {
+    if (!/^[a-f0-9]{64}$/i.test(expected)) throw new Error('Invalid commentJsonSha256')
+    if (typeof require !== 'function') throw new Error('commentJsonSha256 requires Node.js crypto')
+    const digest = require('node:crypto').createHash('sha256').update(code).digest('hex')
+    if (digest !== expected.toLowerCase()) throw new Error(`Sub-Store file ${file} checksum mismatch`)
+  }
+  const moduleUrl = `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
+  const library = (await import(moduleUrl)).library
+  if (typeof library?.parse !== 'function' || typeof library?.stringify !== 'function') {
+    throw new Error('Sub-Store file does not export comment-json')
+  }
+  return library
+}
+
 function loadProviders() {
   const fileRef = function (name) {
     const files = readArray('files');
     const f = files.find(function (x) { return x && x.name === name; });
     if (!f) throw new Error('providers file not found: ' + name);
     if (!f.content) throw new Error('providers file has no local content: ' + name);
-    return JSON.parse(f.content);
+    try { return JSON.parse(f.content); } catch (error) {
+      throw new Error('providers file is not valid JSON: ' + (error.message || error));
+    }
   };
   const asArray = function (v) {
     if (Array.isArray(v)) return v;
-    const o = JSON.parse(v);
+    let o;
+    try { o = JSON.parse(v); } catch (error) {
+      throw new Error('providers is not valid JSON: ' + (error.message || error));
+    }
     return Array.isArray(o) ? o : [o];
   };
   let raw;
@@ -54,8 +80,8 @@ function loadProviders() {
   if (s.indexOf('/api/file/') === 0) return asArray(fileRef(decodeURIComponent(s.split('/').pop())));
   if (type === 'file') return asArray(fileRef(s));
   if (type === 'string') return asArray(s);
-  try { return asArray(s); } catch (e) { /* 继续尝试文件 */ }
-  try { return asArray(fileRef(s)); } catch (e2) {
+  try { return asArray(s); } catch { /* 继续尝试文件 */ }
+  try { return asArray(fileRef(s)); } catch {
     console.log('psn: providers 既不是 JSON 也不是文件: ' + s);
     return [];
   }
@@ -103,7 +129,7 @@ function readArray(key) {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) return parsed;
     }
-  } catch (e) { /* 读不到就当没有 */ }
+  } catch { /* 读不到就当没有 */ }
   return [];
 }
 
@@ -162,7 +188,7 @@ function mihomoDnsToServer(addr) {
 }
 
 try {
-  const config = JSON.parse($content);
+  const config = CommentJSON.parse($content);
   for (const cfg of providers) {
     if (!cfg || !cfg.psnSub) continue;
     const psnSub = cfg.psnSub;
@@ -181,7 +207,7 @@ try {
       try {
         const sub = readArray('subs').find(function (s) { return s && s.name === psnSub; });
         if (sub && sub.content) doc = yaml.load(sub.content);
-      } catch (e) { /* 忽略 */ }
+      } catch { /* 忽略 */ }
       if (!doc && cfg.psnFile) {
         // 3. 远程订阅：通过 Sub-Store 文件拿原始内容
         //    type=file 的 raw 不做 Clash 预处理，保留完整 yaml（含 dns 段）
@@ -276,7 +302,7 @@ try {
       }
     });
   }
-  $content = JSON.stringify(config, null, 2);
+  $content = CommentJSON.stringify(config, null, 2);
 } catch (e) {
   console.log('psn: inject failed: ' + (e && e.message || e));
 }

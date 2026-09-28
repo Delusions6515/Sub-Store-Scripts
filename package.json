@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "scripts": {
+    "build": "node sing-box/build-scripts.mjs",
+    "pretest": "npm run build",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "comment-json": "5.0.0",
+    "esbuild": "^0.25.0"
+  }
+}

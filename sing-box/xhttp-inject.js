@@ -1,4 +1,4 @@
-// xhttp-inject.js —— 响应端脚本，放在 template.js 之后、gen_config.js 之前
+// xhttp-inject.js —— 响应端脚本，放在 template.js 之后
 //
 // 配合 sing-box/xhttp-prep.js（订阅 process 脚本）使用：
 //   1. xhttp-prep.js 把 xhttp/splithttp 节点降级为 tcp 占位、抽走 VLESS
@@ -14,6 +14,25 @@
 //   mode / host / path / headers 原样透传；其余 Sub-Store kebab-case → sing-box
 //   snake_case。download-settings（Xray）与 reuse-settings（mihomo）为各自
 //   客户端特有，sing-box 无对应字段，不输出。
+
+// comment-json is supplied by a Sub-Store file (local or Release URL).
+async function loadCommentJSON() {
+  const file = $arguments?.commentJsonFile || 'comment-json'
+  const code = await produceArtifact({ type: 'file', name: file })
+  const expected = $arguments?.commentJsonSha256
+  if (expected != null && expected !== '') {
+    if (!/^[a-f0-9]{64}$/i.test(expected)) throw new Error('Invalid commentJsonSha256')
+    if (typeof require !== 'function') throw new Error('commentJsonSha256 requires Node.js crypto')
+    const digest = require('node:crypto').createHash('sha256').update(code).digest('hex')
+    if (digest !== expected.toLowerCase()) throw new Error(`Sub-Store file ${file} checksum mismatch`)
+  }
+  const moduleUrl = `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
+  const library = (await import(moduleUrl)).library
+  if (typeof library?.parse !== 'function' || typeof library?.stringify !== 'function') {
+    throw new Error('Sub-Store file does not export comment-json')
+  }
+  return library
+}
 
 const XHTTP_CACHE_PREFIX = 'xhttp-node:' // 与 xhttp-prep.js 一致
 
@@ -65,15 +84,16 @@ function buildXhttpTransport(xhttpOpts) {
   return transport
 }
 
+const CommentJSON = await loadCommentJSON()
 let config
 try {
-  config = JSON.parse($content)
+  config = CommentJSON.parse($content)
 } catch (e) {
   // 探路阶段 $content 未定义抛的是 ReferenceError，原样重抛，
   // 让 Sub-Store 识别为探路失败后回退到正确作用域（与 template.js 行为一致）；
   // 真正的 JSON 语法错误则包装成可读信息。
   throw e instanceof SyntaxError
-    ? new Error(`xhttp-inject: $content 不是合法 JSON: ${e.message ?? e}`)
+    ? new Error(`xhttp-inject: $content 不是合法 JSONC: ${e.message ?? e}`)
     : e
 }
 
@@ -89,4 +109,4 @@ for (const outbound of config.outbounds) {
   }
 }
 
-$content = JSON.stringify(config, null, 2)
+$content = CommentJSON.stringify(config, null, 2)
