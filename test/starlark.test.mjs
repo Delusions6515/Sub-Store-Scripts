@@ -66,8 +66,10 @@ test('template preserves arbitrary nested Starlark markers while adding outbound
 })
 
 test('xhttp injection preserves comments when changing an outbound', async () => {
-  const cache = new Map([['xhttp-node:from-sub', {
-    network: 'xhttp', xhttpOpts: { path: '/x' }, encryption: 'mlkem768x25519plus.native.600m.1rtt.test',
+  const encryption = `mlkem768x25519plus.native.1rtt.${Buffer.alloc(32, 7).toString('base64url')}`
+  const key = 'xhttp-node:v2:' + JSON.stringify(['from-sub', 'vless', 'example.org', null, ''])
+  const cache = new Map([[key, {
+    network: 'xhttp', xhttpOpts: { path: '/x' }, encryption,
   }]])
   const output = await run('sing-box/xhttp-inject.js', {
     content: snippet.replace('"type": "selector", "tag": "🗺️ all", "outbounds": []', '"type": "vless", "tag": "from-sub", "server": "example.org"'),
@@ -75,6 +77,7 @@ test('xhttp injection preserves comments when changing an outbound', async () =>
   })
   assert.equal((output.match(/@starlark/g) || []).length, 2)
   assert.match(output, /"transport":\s*\{\s*"type": "xhttp"/)
+  assert.ok(output.includes(encryption))
 })
 
 test('psn injection edits DNS and outbound without erasing Starlark', async () => {
