@@ -8,8 +8,6 @@
 //     psnPrefix - 节点 tag 前缀过滤（默认 `${psnSub} / `，可按实际格式自定义）
 //     detour    - 可选，DNS 查询走的出站 tag（如 Proxy / Direct），留空则直连
 //     psn       - 可选，手动指定 proxy-server-nameserver（用 | 分隔多个），优先于从订阅读取
-//     psnFile   - 可选，Sub-Store 文件（source=remote 填机场订阅 URL，或本地内容）用于读取完整 mihomo yaml；
-//                 远程订阅（库里无 content）必须配这个或 psn，否则读不到 dns 配置
 //
 // providers 的两种写法：
 //   1. JSON 字符串：providers = '[{"psnSub":"YOUR_PROVIDER","psnTag":"psn"}]'
@@ -17,7 +15,7 @@
 //   可选 providersType = 'string' | 'file' | 'auto'（默认 auto 自动判断：先试 JSON，失败再按文件找）
 //
 // 单提供商写法：$arguments.psnSub ($arguments 直接为 $arguments.providers[0])
-// 可选 psnTag / psnPrefix / detour / psn / psnFile
+// 可选 psnTag / psnPrefix / detour / psn
 //
 // mihomo DNS 写法覆盖: system / 裸IP / udp:// tcp:// tls:// https:// quic:// dhcp://
 // 附加参数: #h3 #skip-cert-verify 生效; #proxy/#interface/#RULES 保留原 DNS 但舍弃该参数
@@ -203,23 +201,14 @@ try {
       psnList = String(cfg.psn).split('|').map(function (s) { return s.trim(); }).filter(Boolean);
       psnSource = 'manual';
     } else {
-      // 2. 本地订阅内容（库里有 content 的）
+      // 2. 订阅原始内容：includeRaw 返回 context.raw 对应的未预处理内容，
+      //    本地或远程订阅都能读到完整 mihomo yaml（含 dns 段），无需再建同源本地文件
       try {
-        const sub = readArray('subs').find(function (s) { return s && s.name === psnSub; });
-        if (sub && sub.content) doc = yaml.load(sub.content);
-      } catch { /* 忽略 */ }
-      if (!doc && cfg.psnFile) {
-        // 3. 远程订阅：通过 Sub-Store 文件拿原始内容
-        //    type=file 的 raw 不做 Clash 预处理，保留完整 yaml（含 dns 段）
-        //    注意：type=subscription 的 raw 会被 Clash Pre-processor 处理成只剩 proxies，拿不到 dns（所有版本都如此）
-        try {
-          const rawResult = await produceArtifact({ type: 'file', name: cfg.psnFile, produceType: 'raw' });
-          const arr = JSON.parse(rawResult);
-          const text = (Array.isArray(arr) ? arr : [arr]).filter(function (i) { return typeof i === 'string' && i.length > 0; })[0];
-          if (text) doc = yaml.load(text);
-        } catch (e) {
-          console.log('psn[' + psnSub + ']: produceArtifact file raw failed: ' + (e && e.message || e));
-        }
+        const { raw } = await produceArtifact({ type: 'subscription', name: psnSub, includeRaw: true });
+        const text = (Array.isArray(raw) ? raw : [raw]).filter(function (i) { return typeof i === 'string' && i.length > 0; })[0];
+        if (text) doc = yaml.load(text);
+      } catch (e) {
+        console.log('psn[' + psnSub + ']: produceArtifact subscription includeRaw failed: ' + (e && e.message || e));
       }
       if (doc && doc.dns) {
         if (doc.dns['proxy-server-nameserver']) {

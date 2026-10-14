@@ -35,9 +35,9 @@
  * - [http_meta_start_delay] 初始启动延时(单位: 毫秒) 默认: 3000
  * - [http_meta_proxy_timeout] 每个节点耗时(单位: 毫秒). 默认: 10000
  *
- * dns / hosts 参数 (读取优先级: dns/hosts 手动参数 > sub 订阅 content > psnFile 文件)
+ * dns / hosts 参数 (读取优先级: dns/hosts 手动参数 > sub 订阅原始内容)
  * - [sub] mihomo 订阅名 (如 sub=YOUR_SUB), 读取该订阅 yaml 的 dns + hosts 段
- * - [psnFile] Sub-Store 文件引用回退 (远程订阅库里无 content 时用, produceArtifact type:file raw)
+ *       本地或远程订阅都通过 produceArtifact includeRaw 读取未预处理内容
  * - [dns] 手动指定 dns 段 (YAML 字符串), 优先级最高
  * - [hosts] 手动指定 hosts 段 (YAML 字符串), 优先级最高
  *
@@ -60,19 +60,7 @@
  * - [disable_failed_cache/ignore_failed_error] 禁用失败缓存. 即不缓存失败结果
  */
 
-function readArray(key) {
-  try {
-    const raw = ($substore && $substore.read) ? $substore.read(key) : null;
-    if (Array.isArray(raw)) return raw;
-    if (typeof raw === 'string') {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return parsed;
-    }
-  } catch (e) { /* 读不到就当没有 */ }
-  return [];
-}
-
-// 读取 dns + hosts: 手动参数 > 订阅 content > psnFile (produceArtifact type:file raw)
+// 读取 dns + hosts: 手动参数 > 订阅原始内容 (produceArtifact includeRaw)
 // 非手动指定的 dns 会做白名单清洗, 只保留 nameserver/fallback 相关 + 基础行为字段,
 // 去掉路由相关 (fallback-filter / respect-rules / geosite|geoip 前缀的 policy), 避免测试核心下载 .dat
 function sanitizeDns(dns) {
@@ -111,7 +99,7 @@ function sanitizeDns(dns) {
   return Object.keys(out).length ? out : null;
 }
 
-// 读取 dns + hosts: 手动参数 > 订阅 content > psnFile (produceArtifact type:file raw)
+// 读取 dns + hosts: 手动参数 > 订阅原始内容 (produceArtifact includeRaw)
 async function loadDnsHosts() {
   const out = { dns: null, hosts: null };
   // 1. 手动指定: 原样透传, 不清洗
@@ -125,22 +113,16 @@ async function loadDnsHosts() {
   let doc = null;
   if ($arguments.sub) {
     try {
-      const sub = readArray('subs').find(function (s) { return s && s.name === $arguments.sub; });
-      if (sub && sub.content) doc = yaml.load(sub.content);
-    } catch (e) { /* 忽略 */ }
-  }
-  if (!doc && $arguments.psnFile) {
-    try {
-      const rawResult = await produceArtifact({ type: 'file', name: $arguments.psnFile, produceType: 'raw' });
-      const arr = JSON.parse(rawResult);
-      const text = (Array.isArray(arr) ? arr : [arr]).filter(function (i) { return typeof i === 'string' && i.length > 0; })[0];
+      // includeRaw 返回 context.raw 对应的未预处理内容, 本地/远程订阅都能读到完整 yaml
+      const { raw } = await produceArtifact({ type: 'subscription', name: $arguments.sub, includeRaw: true });
+      const text = (Array.isArray(raw) ? raw : [raw]).filter(function (i) { return typeof i === 'string' && i.length > 0; })[0];
       if (text) doc = yaml.load(text);
     } catch (e) {
-      $substore.info('[http-meta] produceArtifact file raw failed: ' + (e.message || e));
+      $substore.info('[http-meta] produceArtifact subscription includeRaw failed: ' + (e.message || e));
     }
   }
   if (doc) {
-    // 2/3. 从订阅/文件读取: dns 做白名单清洗, hosts 原样
+    // 2. 从订阅读取: dns 做白名单清洗, hosts 原样
     if (!out.dns && doc.dns) out.dns = sanitizeDns(doc.dns);
     if (!out.hosts && doc.hosts) out.hosts = doc.hosts;
   }
