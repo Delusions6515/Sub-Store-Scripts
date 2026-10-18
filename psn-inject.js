@@ -201,14 +201,21 @@ try {
       psnList = String(cfg.psn).split('|').map(function (s) { return s.trim(); }).filter(Boolean);
       psnSource = 'manual';
     } else {
-      // 2. 订阅原始内容：includeRaw 返回 context.raw 对应的未预处理内容，
-      //    本地或远程订阅都能读到完整 mihomo yaml（含 dns 段），无需再建同源本地文件
+      // 2. 订阅原始内容：produceType=raw 在跑订阅的 process 链之前返回，
+      //    避免该订阅自身也启用本脚本时递归调用；
+      //    includeRaw 同时给出 context.raw 对应的未预处理内容，本地/远程订阅都能读到完整 mihomo yaml（含 dns 段）
       try {
-        const { raw } = await produceArtifact({ type: 'subscription', name: psnSub, includeRaw: true });
-        const text = (Array.isArray(raw) ? raw : [raw]).filter(function (i) { return typeof i === 'string' && i.length > 0; })[0];
+        const { raw } = await produceArtifact({
+          type: 'subscription',
+          name: psnSub,
+          produceType: 'raw',
+          includeRaw: true,
+        });
+        if (!Array.isArray(raw)) throw new Error('需要 Sub-Store 2.42.4 及以上版本支持 includeRaw');
+        const text = raw.filter(function (i) { return typeof i === 'string' && i.length > 0; })[0];
         if (text) doc = yaml.load(text);
       } catch (e) {
-        console.log('psn[' + psnSub + ']: produceArtifact subscription includeRaw failed: ' + (e && e.message || e));
+        console.log('psn[' + psnSub + ']: 读取订阅原始内容失败: ' + (e && e.message || e));
       }
       if (doc && doc.dns) {
         if (doc.dns['proxy-server-nameserver']) {

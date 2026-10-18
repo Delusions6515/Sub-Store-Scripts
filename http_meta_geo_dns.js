@@ -113,12 +113,19 @@ async function loadDnsHosts() {
   let doc = null;
   if ($arguments.sub) {
     try {
-      // includeRaw 返回 context.raw 对应的未预处理内容, 本地/远程订阅都能读到完整 yaml
-      const { raw } = await produceArtifact({ type: 'subscription', name: $arguments.sub, includeRaw: true });
-      const text = (Array.isArray(raw) ? raw : [raw]).filter(function (i) { return typeof i === 'string' && i.length > 0; })[0];
+      // produceType=raw 在跑订阅的 process 链之前返回, 避免该订阅自身也启用本脚本时递归调用;
+      // includeRaw 同时给出 context.raw 对应的未预处理内容, 本地/远程订阅都能读到完整 yaml
+      const { raw } = await produceArtifact({
+        type: 'subscription',
+        name: $arguments.sub,
+        produceType: 'raw',
+        includeRaw: true,
+      });
+      if (!Array.isArray(raw)) throw new Error('需要 Sub-Store 2.42.4 及以上版本支持 includeRaw');
+      const text = raw.filter(function (i) { return typeof i === 'string' && i.length > 0; })[0];
       if (text) doc = yaml.load(text);
     } catch (e) {
-      $substore.info('[http-meta] produceArtifact subscription includeRaw failed: ' + (e.message || e));
+      $substore.info('[http-meta] 读取订阅原始内容失败: ' + (e.message || e));
     }
   }
   if (doc) {
